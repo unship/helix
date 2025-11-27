@@ -428,6 +428,9 @@ pub struct Config {
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
     pub buffer_picker: BufferPickerConfig,
+    /// Root directories to scan for git repositories with :project-scan command.
+    /// Defaults to empty (will use home directory).
+    pub project_scan_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Clone, Copy)]
@@ -1146,6 +1149,7 @@ impl Default for Config {
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
             buffer_picker: BufferPickerConfig::default(),
+            project_scan_roots: vec![PathBuf::from("/home/SENSETIME/liyanan/lyn/src/github.com/vscode/helix")],
         }
     }
 }

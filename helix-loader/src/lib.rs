@@ -1,5 +1,6 @@
 pub mod config;
 pub mod grammar;
+pub mod projects;
 
 use helix_stdx::{env::current_working_dir, path};
 
@@ -266,7 +267,7 @@ fn default_config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-fn ensure_parent_dir(path: &Path) {
+pub(crate) fn ensure_parent_dir(path: &Path) {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent).ok();

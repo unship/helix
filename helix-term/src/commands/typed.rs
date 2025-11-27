@@ -2728,6 +2728,243 @@ fn noop(_cx: &mut compositor::Context, _args: Args, _event: PromptEvent) -> anyh
     Ok(())
 }
 
+fn project_scan(
+    cx: &mut compositor::Context,
+    args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    use helix_loader::projects;
+    use helix_stdx::path::expand_tilde;
+    use std::path::Path;
+
+    // Determine root directories to scan
+    // Priority: command args > config project_scan_roots > home directory
+    let roots: Vec<std::path::PathBuf> = if !args.is_empty() {
+        // Use command line arguments
+        args.iter()
+            .map(|arg| expand_tilde(Path::new(arg.as_ref())).into_owned())
+            .collect()
+    } else {
+        // Use configured roots, or fall back to home directory
+        let config_roots = &cx.editor.config().project_scan_roots;
+        if config_roots.is_empty() {
+            vec![home_dir()?]
+        } else {
+            config_roots.iter()
+                .map(|p| expand_tilde(p).into_owned())
+                .collect()
+        }
+    };
+
+    // Validate all roots exist and are directories
+    for root in &roots {
+        if !root.exists() {
+            return Err(anyhow!("Root directory does not exist: {}", root.display()));
+        }
+        if !root.is_dir() {
+            return Err(anyhow!("Path is not a directory: {}", root.display()));
+        }
+    }
+
+    // Show status that scanning has started
+    let roots_display: Vec<_> = roots.iter().map(|r| r.display().to_string()).collect();
+    cx.editor.set_status(format!("Scanning for git repositories in {}...", roots_display.join(", ")));
+
+    // Perform scanning in background to avoid blocking UI
+    // Use spawn_blocking to avoid blocking the tokio runtime during file system operations
+    let callback = async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut all_repos = Vec::new();
+            for root_path in &roots {
+                match projects::scan_git_repositories(root_path) {
+                    Ok(repos) => all_repos.extend(repos),
+                    Err(e) => {
+                        return Err(format!("Failed to scan {}: {}", root_path.display(), e));
+                    }
+                }
+            }
+
+            // Load existing projects
+            let mut existing_projects = projects::load_projects().unwrap_or_default();
+            let mut existing_paths: std::collections::HashSet<_> = existing_projects
+                .iter()
+                .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
+                .collect();
+
+            // Add new repositories
+            let mut new_count = 0;
+            for repo_path in &all_repos {
+                let canonical = repo_path.canonicalize().unwrap_or_else(|_| repo_path.clone());
+                if !existing_paths.contains(&canonical) {
+                    let name = repo_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string());
+                    existing_paths.insert(canonical.clone());
+                    existing_projects.push(projects::Project {
+                        path: canonical,
+                        name,
+                        last_accessed: None,
+                    });
+                    new_count += 1;
+                }
+            }
+
+            // Save updated projects
+            let total_count = existing_projects.len();
+            let save_result = projects::save_projects(&existing_projects);
+
+            Ok((all_repos, new_count, total_count, save_result))
+        }).await;
+
+        let call: job::Callback = match result {
+            Ok(Ok((all_repos, new_count, total_count, save_result))) => {
+                job::Callback::Editor(Box::new(move |editor| {
+                    match save_result {
+                        Ok(_) => {
+                            editor.set_status(format!(
+                                "Found {} git repositories ({} new). Total projects: {}",
+                                all_repos.len(),
+                                new_count,
+                                total_count
+                            ));
+                        }
+                        Err(e) => {
+                            editor.set_error(format!("Failed to save projects: {}", e));
+                        }
+                    }
+                }))
+            }
+            Ok(Err(err_msg)) => {
+                job::Callback::Editor(Box::new(move |editor| {
+                    editor.set_error(err_msg);
+                }))
+            }
+            Err(e) => {
+                job::Callback::Editor(Box::new(move |editor| {
+                    editor.set_error(format!("Scanning task failed: {}", e));
+                }))
+            }
+        };
+        Ok(call)
+    };
+
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
+fn project_switch(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    use helix_loader::projects;
+
+    // Load projects
+    let projects_list = match projects::load_projects() {
+        Ok(projs) => projs,
+        Err(e) => {
+            cx.editor.set_error(format!("Failed to load projects: {}", e));
+            return Ok(());
+        }
+    };
+
+    if projects_list.is_empty() {
+        cx.editor.set_error("No projects found. Use :project-scan to scan for git repositories.");
+        return Ok(());
+    }
+
+    // Use callback to push layer
+    let callback = async move {
+        use ui::overlay::overlaid;
+        use ui::PickerColumn;
+
+        // Reload projects in case they were updated
+        let projects_list_for_picker = match projects::load_projects() {
+            Ok(projs) => projs,
+            Err(e) => {
+                let call: job::Callback = job::Callback::Editor(Box::new(move |editor| {
+                    editor.set_error(format!("Failed to load projects: {}", e));
+                }));
+                return Ok(call);
+            }
+        };
+
+        let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+            move |_editor: &mut helix_view::Editor, compositor: &mut crate::compositor::Compositor| {
+                // Create picker columns
+                let columns = [PickerColumn::new(
+                    "path",
+                    |project: &projects::Project, _: &()| {
+                        let path_str = project.path.to_string_lossy();
+                        if let Some(name) = &project.name {
+                            format!("{} ({})", name, path_str).into()
+                        } else {
+                            path_str.into()
+                        }
+                    },
+                )];
+
+                // Create picker
+                let picker = ui::Picker::new(
+                    columns,
+                    0,
+                    projects_list_for_picker.clone(),
+                    (),
+                    move |cx, project: &projects::Project, _action| {
+                        let project_path = &project.path;
+                        if !project_path.exists() {
+                            cx.editor.set_error(format!(
+                                "Project path does not exist: {}",
+                                project_path.display()
+                            ));
+                            return;
+                        }
+
+                        // Change working directory
+                        if let Err(e) = cx.editor.set_cwd(project_path) {
+                            cx.editor.set_error(format!(
+                                "Failed to change directory to {}: {}",
+                                project_path.display(),
+                                e
+                            ));
+                            return;
+                        }
+
+                        // Update last accessed time - reload projects to get latest state
+                        if let Ok(mut updated_projects) = projects::load_projects() {
+                            projects::update_project_last_accessed(&mut updated_projects, project_path);
+                            if let Err(e) = projects::save_projects(&updated_projects) {
+                                log::warn!("Failed to update project last accessed time: {}", e);
+                            }
+                        }
+
+                        cx.editor.set_status(format!(
+                            "Switched to project: {}",
+                            project_path.display()
+                        ));
+                    },
+                );
+
+                compositor.push(Box::new(overlaid(picker)));
+            },
+        ));
+        Ok(call)
+    };
+    cx.jobs.callback(callback);
+
+    Ok(())
+}
+
 /// This command accepts a single boolean --skip-visible flag and no positionals.
 const BUFFER_CLOSE_OTHERS_SIGNATURE: Signature = Signature {
     positionals: (0, Some(0)),
@@ -2818,6 +3055,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         completer: CommandCompleter::all(completers::filename),
         signature: Signature {
             positionals: (1, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "project-scan",
+        aliases: &[],
+        doc: "Scan root directories for git repositories and persist the results. Uses configured project-scan-roots, or home directory if not configured.",
+        fun: project_scan,
+        completer: CommandCompleter::all(completers::filename),
+        signature: Signature {
+            positionals: (0, None),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "project-switch",
+        aliases: &["ps"],
+        doc: "Switch to a project from the persisted list using a picker.",
+        fun: project_switch,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
             ..Signature::DEFAULT
         },
     },
