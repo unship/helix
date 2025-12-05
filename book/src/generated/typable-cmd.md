@@ -5,6 +5,8 @@
 | `:quit`, `:q` | Close the current view. |
 | `:quit!`, `:q!` | Force close the current view, ignoring unsaved changes. |
 | `:open`, `:o`, `:edit`, `:e` | Open a file from disk into the current view. |
+| `:project-scan` | Scan root directories for git repositories and persist the results. Uses configured project-scan-roots, or home directory if not configured. |
+| `:project-switch`, `:ps` | Switch to a project from the persisted list using a picker. |
 | `:buffer-close`, `:bc`, `:bclose` | Close the current buffer. |
 | `:buffer-close!`, `:bc!`, `:bclose!` | Close the current buffer forcefully, ignoring unsaved changes. |
 | `:buffer-close-others`, `:bco`, `:bcloseother` | Close all buffers but the currently focused one. |
